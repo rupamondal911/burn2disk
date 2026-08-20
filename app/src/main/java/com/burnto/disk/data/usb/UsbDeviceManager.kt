@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.util.Log
 import com.burnto.disk.data.model.UsbDeviceInfo
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -32,10 +33,12 @@ class UsbDeviceManager @Inject constructor(
 
     companion object {
         const val ACTION_USB_PERMISSION = "com.burnto.disk.USB_PERMISSION"
+        private const val TAG = "UsbDeviceManager"
     }
 
     /** Lists currently connected USB mass-storage devices as UI models. */
     fun listDevices(): List<UsbDeviceInfo> {
+        Log.d(TAG, "listDevices() called")
         return UsbMassStorageDevice.getMassStorageDevices(context).map { msd ->
             val dev = msd.usbDevice
             val hasPerm = usbManager.hasPermission(dev)
@@ -43,6 +46,7 @@ class UsbDeviceManager @Inject constructor(
             var capacityBytes = 0L
             var fsLabel = "Unknown"
             if (hasPerm) {
+                Log.d(TAG, "listDevices: init() on ${dev.deviceName}...")
                 runCatching {
                     msd.init()
                     val partition = msd.partitions.firstOrNull()
@@ -52,6 +56,7 @@ class UsbDeviceManager @Inject constructor(
                         fsLabel = describeFs(fs.type)
                     }
                 }
+                Log.d(TAG, "listDevices: close() on ${dev.deviceName}")
                 runCatching { msd.close() }
             }
 

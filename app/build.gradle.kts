@@ -113,6 +113,25 @@ dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 }
 
+// --- 16KB page alignment for native libs (Android 16+) ---
+afterEvaluate {
+    tasks.findByName("mergeDebugNativeLibs")?.doLast {
+        val jniDir = file("${layout.buildDirectory.get()}/intermediates/merged_native_libs/debug/mergeDebugNativeLibs/out/lib")
+        if (!jniDir.exists()) {
+            logger.lifecycle("realignNativeLibs: $jniDir not found, skipping")
+            return@doLast
+        }
+        val script = file("${rootDir}/realign_native_libs.py")
+        val python = if (System.getProperty("os.name").lowercase().contains("windows")) "python" else "python3"
+        val proc = ProcessBuilder(python, script.absolutePath, jniDir.absolutePath)
+            .redirectErrorStream(true)
+            .start()
+        proc.inputStream.bufferedReader().forEachLine { logger.lifecycle(it) }
+        val exit = proc.waitFor()
+        if (exit != 0) throw GradleException("realign_native_libs.py failed (exit $exit)")
+    }
+}
+
 kapt {
     correctErrorTypes = true
 }

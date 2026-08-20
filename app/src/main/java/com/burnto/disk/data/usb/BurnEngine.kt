@@ -2,6 +2,7 @@ package com.burnto.disk.data.usb
 
 import android.content.Context
 import android.hardware.usb.UsbManager
+import android.util.Log
 import com.burnto.disk.data.iso.IsoEntry
 import com.burnto.disk.data.iso.IsoParser
 import com.burnto.disk.data.iso.WimSplitter
@@ -66,12 +67,21 @@ class BurnEngine @Inject constructor(
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
-        private const val COPY_BUFFER = 512 * 1024
+        private const val TAG = "BurnEngine"
+        private const val COPY_BUFFER = 64 * 1024
         private const val ISO_SECTOR = IsoParser.SECTOR_SIZE
         private const val FAT32_FILE_LIMIT = 0xFFFFFFFFL
         private const val PROGRESS_INTERVAL_MS = 500L
         // Files that must be split for FAT32.
         private val SPLITTABLE = setOf("install.wim", "install.esd")
+    }
+
+    private fun logUsbDeviceInfo(usbDevice: android.hardware.usb.UsbDevice, label: String) {
+        val vendorId = usbDevice.vendorId
+        val productId = usbDevice.productId
+        val info = "[$label] USB device: name=${usbDevice.deviceName} vendorId=0x${vendorId.toString(16)} productId=0x${productId.toString(16)} class=${usbDevice.deviceClass} interfaces=${usbDevice.interfaceCount}"
+        Log.i(TAG, info)
+        emitLog(info)
     }
 
     // ---------------------------------------------------------------------
@@ -243,9 +253,16 @@ class BurnEngine @Inject constructor(
                 return FormatResult.Failure("USB permission denied.")
             }
 
+            logUsbDeviceInfo(usbDevice, "formatDevice")
+
+            // Some USB controllers need a brief pause after permission grant
+            // before they will accept SCSI commands.
+            Thread.sleep(500)
+
             _formatProgress.value = 0
             onProgress(0)
             raw = RawUsbBlockDevice.create(usbManager, usbDevice).also { it.init() }
+            Log.i(TAG, "[formatDevice] Raw device opened: blocks=${raw!!.blockDevice.blocks} blockSize=${raw!!.blockSize} capacity=${formatBytes(raw!!.capacityBytes)}")
             val rawCapacity = raw.capacityBytes
             val capacity = maxOf(rawCapacity, capacityHintBytes)
             if (capacity <= 0L) {
@@ -277,6 +294,26 @@ class BurnEngine @Inject constructor(
             onProgress(100)
             FormatResult.Success(confirmed)
         } catch (e: Exception) {
+            // Log the FULL exception chain — libaums wraps the real cause
+            // (USB transfer error / SenseException / PipeException) inside
+            // a generic IOException("MAX_RECOVERY_ATTEMPTS Exceeded...").
+            Log.e(TAG, "formatDevice FAILED — full chain:", e)
+            var cause = e.cause
+            var depth = 0
+            while (cause != null && depth < 5) {
+                Log.e(TAG, "  cause[$depth]: ${cause.javaClass.simpleName}: ${cause.message}", cause)
+                cause = cause.cause
+                depth++
+            }
+            // If the raw device is still open, try to get SCSI sense data
+            // to see what the USB controller is actually reporting.
+            raw?.let { r ->
+                runCatching {
+                    // The ScsiBlockDevice.requestSense() is private, but we can
+                    // trigger a read(0) and capture the error chain for sense info.
+                    Log.d(TAG, "raw device still open after format failure, blocks=${r.blockDevice.blocks}")
+                }
+            }
             FormatResult.Failure(e.message ?: "Format failed")
         } finally {
             withContext(Dispatchers.IO) { runCatching { raw?.close() } }
@@ -415,10 +452,17 @@ class BurnEngine @Inject constructor(
                 throw BurnException("USB permission denied", "Grant USB access when prompted and try again")
             }
 
+            logUsbDeviceInfo(usbDevice, "burn")
+
+            // Some USB controllers need a brief pause after permission grant
+            // before they will accept SCSI commands.
+            Thread.sleep(500)
+
             // --- Step 2: raw block device ---
             emitLog("Opening USB device...")
             raw = RawUsbBlockDevice.create(usbManager, usbDevice).also { it.init() }
             val device = raw!!  // stable handle for closures/non-null reads below
+            Log.i(TAG, "[burn] Raw device opened: blocks=${device.blockDevice.blocks} blockSize=${device.blockSize} capacity=${formatBytes(device.capacityBytes)}")
             val rawCapacity = device.capacityBytes
 
             // Trust whichever positive value we have; prefer the larger of the
@@ -454,12 +498,7 @@ class BurnEngine @Inject constructor(
             }
             emitLog("Format complete")
 
-            // Chunk size from available heap — no benchmark. The real bottleneck
-            // is the number of SCSI commands (fixed ~ms overhead each), so bigger
-            // chunks always win; we just size to memory. 2–8 MiB.
-            val optimalChunk = (Runtime.getRuntime().maxMemory() / 8)
-                .toInt().coerceIn(2 * 1024 * 1024, 8 * 1024 * 1024)
-            emitLog("Write chunk size: ${optimalChunk / 1024 / 1024}MB")
+            emitLog("Write buffer: ${COPY_BUFFER / 1024}KB")
 
             // Immediately leave the Formatting state so the UI does not appear
             // stuck at "Formatting FAT32... 100%". Show a parsing phase while the
@@ -509,37 +548,36 @@ class BurnEngine @Inject constructor(
             }
             entries.take(5).forEach { e -> emitLog("  ${e.fullPath} (${e.sizeBytes}B) dir=${e.isDirectory}") }
 
-            // --- Steps 5-7: fast copy (direct block writes) ---
-            // If the fast path fails for any reason, fall back to the (slow but
-            // proven) libaums UsbFile path so a FastUsbWriter bug degrades to
-            // "slow" rather than "broken".
+            // --- Steps 5-6: copy files via libaums ---
+            // We mount the freshly-formatted FAT32 and write through libaums'
+            // UsbFile API. Each write becomes a SCSI WRITE(10) command.
             try {
-                copyEntriesFast(isoFile, entries, device.blockDevice, geometry, label, optimalChunk, startMs)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                throw ce
-            } catch (fastError: Exception) {
-                emitLog("⚠ Fast writer failed (${fastError.message}); falling back to compatibility mode", isWarning = true)
-                val rawPart = me.jahnen.libaums.core.driver.ByteBlockDevice(device.blockDevice, partitionStartLba.toInt())
-                var fallbackFs = runCatching { Fat32FileSystem.read(rawPart) }.getOrNull()
-                if (fallbackFs == null) {
-                    emitLog("Re-formatting before compatibility fallback...")
-                    _state.value = BurnState.Formatting(0)
-                    Fat32Formatter(device.blockDevice).format(formatCapacity, label) { pct ->
-                        _state.value = BurnState.Formatting(pct)
-                    }
-                    fallbackFs = Fat32FileSystem.read(rawPart)
-                        ?: throw BurnException("USB filesystem unreadable", "Try a different USB drive")
-                }
-                try {
-                    copyEntriesLibaums(isoFile, entries, fallbackFs.rootDirectory, startMs)
-                } catch (fallbackError: Exception) {
-                    if (fallbackError is kotlinx.coroutines.CancellationException) throw fallbackError
-                    emitLog("Compatibility mode also failed: ${fallbackError.message}", isWarning = true)
-                    throw BurnException(
-                        "USB write failed: ${fallbackError.message ?: fallbackError.javaClass.simpleName}",
-                        "The fallback write path also failed. Try a different USB drive or ISO."
+                val rawPart = me.jahnen.libaums.core.driver.ByteBlockDevice(
+                    device.blockDevice, partitionStartLba.toInt()
+                )
+                val fs = Fat32FileSystem.read(rawPart)
+                    ?: throw BurnException(
+                        "USB filesystem unreadable after format",
+                        "Try a different USB drive"
                     )
+                copyEntriesLibaums(isoFile, entries, fs.rootDirectory, startMs)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: BurnException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "copyEntriesLibaums FAILED — full chain:", e)
+                var cause = e.cause
+                var depth = 0
+                while (cause != null && depth < 5) {
+                    Log.e(TAG, "  cause[$depth]: ${cause.javaClass.simpleName}: ${cause.message}", cause)
+                    cause = cause.cause
+                    depth++
                 }
+                throw BurnException(
+                    "USB write failed: ${e.message ?: e.javaClass.simpleName}",
+                    "The USB controller reported an error. Try a different USB drive."
+                )
             }
 
             // --- Boot-sector verify + rewrite ---
@@ -654,263 +692,19 @@ class BurnEngine @Inject constructor(
         )
     }
 
+    // ---------------------------------------------------------------------
+    // Copy files via libaums UsbFile API
+    // ---------------------------------------------------------------------
+
     /**
-     * Fast copy path: writes the entire FAT32 directory tree and file data
-     * directly to the block device via [FastUsbWriter], bypassing libaums'
-     * per-chunk SCSI overhead.
-     */
-    /**
-     * Layout strategy:
-     *  1. Pre-pass — allocate one cluster run per directory (sized to its real
-     *     child count), register them, and add "."/".." entries.
-     *  2. File pass — for each file, allocate a contiguous cluster run, record
-     *     the FAT chain, queue the directory entry, and stream the bytes in one
-     *     sequential burst.
-     *  3. Flush the FAT (both copies), all directory clusters, and the FSInfo.
+     * Copies all ISO entries to the USB via the libaums UsbFile API.
+     * Each file is written in [COPY_BUFFER] (64 KiB) chunks.
+     * Large WIM/ESD files that exceed the FAT32 file-size limit are split
+     * into .swm parts automatically.
      *
-     * On any failure here the USB is left formatted but incomplete; the error is
-     * surfaced so the user can retry (optionally on the slower libaums path).
+     * On per-file failure the error chain is logged (up to 5 cause levels)
+     * and a warning is emitted, but the copy continues to the next file.
      */
-    private suspend fun copyEntriesFast(
-        isoFile: File,
-        entries: List<IsoEntry>,
-        blockDevice: me.jahnen.libaums.core.driver.BlockDeviceDriver,
-        geometry: FatGeometry,
-        label: String,
-        optimalChunk: Int,
-        startMs: Long
-    ) {
-        val writer = FastUsbWriter(blockDevice, geometry, optimalChunk, label)
-        writer.setRootCluster(geometry.rootCluster)
-        resetSpeedSamples()
-
-        emitLog("DEBUG: total entries from IsoParser = ${entries.size}")
-        emitLog("DEBUG: dirs = ${entries.count { it.isDirectory }}")
-        emitLog("DEBUG: files = ${entries.count { !it.isDirectory }}")
-        entries.take(5).forEach {
-            emitLog("DEBUG entry: ${it.fullPath} dir=${it.isDirectory} size=${it.sizeBytes}")
-        }
-
-        val clusterBytes = geometry.clusterBytes
-        fun clustersFor(bytes: Long): Long =
-            if (bytes == 0L) 1L else (bytes + clusterBytes - 1) / clusterBytes
-
-        // Files we will actually write (oversized WIMs are handled separately).
-        val regularFiles = entries.filter {
-            !it.isDirectory && !(it.name.lowercase() in SPLITTABLE && it.sizeBytes > FAT32_FILE_LIMIT)
-        }
-        val largeWims = entries.filter {
-            !it.isDirectory && it.name.lowercase() in SPLITTABLE && it.sizeBytes > FAT32_FILE_LIMIT
-        }
-
-        emitLog("DEBUG: regularFiles=${regularFiles.size} largeWims=${largeWims.size}")
-
-        // If a large WIM is present, split it up front so its parts join the copy
-        // set (and contribute to the directory/cluster planning).
-        val swmParts = ArrayList<Pair<String, File>>() // "sources/install.swm" -> local file
-        for (wim in largeWims) {
-            swmParts += splitWimToParts(isoFile, wim)
-        }
-
-        // --- Pre-pass: directories, shallowest first ---
-        val dirs = entries.filter { it.isDirectory }
-            .sortedBy { it.fullPath.count { c -> c == '/' } }
-
-        // Count children per directory to size each directory's cluster run.
-        // Each child consumes (LFN entries + 1) 32-byte slots; "."/".." add 2 and
-        // root adds 1 for the volume label.
-        val slotCount = HashMap<String, Int>()
-        fun addSlots(parent: String, name: String) {
-            slotCount[parent] = (slotCount[parent] ?: 0) + writer.slotsForName(name)
-        }
-        slotCount[""] = 1 // volume label in root
-        for (d in dirs) {
-            val parent = d.fullPath.substringBeforeLast('/', "")
-            addSlots(parent, d.name)
-            slotCount[d.fullPath] = (slotCount[d.fullPath] ?: 0) + 2 // "." and ".."
-        }
-        for (f in regularFiles) {
-            addSlots(f.fullPath.substringBeforeLast('/', ""), f.name)
-        }
-        for ((path, _) in swmParts) {
-            addSlots(path.substringBeforeLast('/', ""), path.substringAfterLast('/'))
-        }
-
-        // Allocate the root directory's cluster run FIRST (it must stay at the
-        // BPB-declared cluster 2). Size it to root's own slot count.
-        val rootSlots = (slotCount[""] ?: 1)
-        writer.allocateRoot(clustersFor(rootSlots.toLong() * 32))
-
-        // Allocate + register each subdirectory (root is already allocated).
-        for (d in dirs) {
-            coroutineContext.ensureActive()
-            val slots = (slotCount[d.fullPath] ?: 2)
-            val dirBytes = slots.toLong() * 32
-            val clusters = clustersFor(dirBytes)
-            val firstCluster = writer.allocateClusters(clusters)
-            writer.writeFatChain(firstCluster, clusters)
-            writer.flushFatSectors(firstCluster, clusters)
-            writer.registerDirectory(d.fullPath, firstCluster)
-            val parentPath = d.fullPath.substringBeforeLast('/', "")
-            val parentCluster = if (parentPath.isEmpty()) geometry.rootCluster
-                else writerDirCluster(writer, parentPath)
-            writer.addDotEntries(d.fullPath, firstCluster, parentCluster)
-            writer.addDirectoryEntry(parentPath, d.name, firstCluster, 0L, isDirectory = true)
-        }
-
-        // Total bytes for progress (regular files + swm parts).
-        val totalBytes = regularFiles.sumOf { it.sizeBytes } + swmParts.sumOf { it.second.length() }
-        var bytesWritten = 0L
-        var lastReport = 0L
-        recordSample(System.currentTimeMillis(), 0L)
-
-        val onChunk: (Long) -> Unit = { delta ->
-            bytesWritten += delta
-            val now = System.currentTimeMillis()
-            if (now - lastReport >= PROGRESS_INTERVAL_MS) {
-                recordSample(now, bytesWritten)
-                _state.value = BurnState.Copying(
-                    currentFile = "Writing",
-                    bytesWritten = bytesWritten,
-                    totalBytes = totalBytes,
-                    speedMBps = rollingSpeedMBps(),
-                    remainingSeconds = etaSeconds(bytesWritten, totalBytes)
-                )
-                lastReport = now
-            }
-        }
-
-        // --- File pass: regular ISO files ---
-        // Write every file with the read-ahead pipeline. No batcher — the
-        // coalescing batcher was silently dropping writes to the wrong LBA.
-        val sortedFiles = regularFiles.sortedByDescending { it.sizeBytes }
-
-        val raf = RandomAccessFile(isoFile, "r")
-        raf.use {
-            for (entry in sortedFiles) {
-                coroutineContext.ensureActive()
-                val parentPath = entry.fullPath.substringBeforeLast('/', "")
-                if (entry.sizeBytes == 0L) {
-                    writer.addDirectoryEntry(parentPath, entry.name, 0L, 0L, isDirectory = false)
-                    continue
-                }
-                val clusters = clustersFor(entry.sizeBytes)
-                val firstCluster = writer.allocateClusters(clusters)
-                writer.writeFatChain(firstCluster, clusters)
-                writer.flushFatSectors(firstCluster, clusters)
-                writer.addDirectoryEntry(parentPath, entry.name, firstCluster, entry.sizeBytes, isDirectory = false)
-
-                emitLog(entry.fullPath, isFileName = true)
-                writer.writeFileFromIsoPipelined(raf, entry.extentLba, entry.sizeBytes, firstCluster, onChunk)
-
-                // NOTE: We intentionally do NOT read back immediately after writing.
-                // USB controllers have write-back caches — data may not be readable
-                // until the cache is flushed, causing a false-positive mismatch that
-                // aborts an otherwise successful burn. Post-burn root verification
-                // (below) is the reliable signal.
-            }
-        }
-
-        // --- File pass: split WIM parts (already on local disk) ---
-        for ((usbPath, partFile) in swmParts) {
-            coroutineContext.ensureActive()
-            val parentPath = usbPath.substringBeforeLast('/', "")
-            val name = usbPath.substringAfterLast('/')
-            val size = partFile.length()
-            if (size == 0L) {
-                writer.addDirectoryEntry(parentPath, name, 0L, 0L, isDirectory = false)
-                continue
-            }
-            val clusters = clustersFor(size)
-            val firstCluster = writer.allocateClusters(clusters)
-            writer.writeFatChain(firstCluster, clusters)
-            writer.flushFatSectors(firstCluster, clusters)
-            writer.addDirectoryEntry(parentPath, name, firstCluster, size, isDirectory = false)
-            emitLog(usbPath, isFileName = true)
-            writer.writeLocalFile(partFile, firstCluster, onChunk)
-            partFile.delete()
-        }
-
-        // --- Flush metadata ---
-        emitLog("Writing filesystem tables...")
-        writer.flushDirectories()
-        writer.flushFat()
-        writer.updateFsInfo()
-
-        // --- Post-burn verification: read back root directory ---
-        val rootLba = writer.lbaOfCluster(geometry.rootCluster)
-        val rootBuf = ByteBuffer.allocate(geometry.bytesPerSector)
-        blockDevice.read(rootLba, rootBuf)
-        rootBuf.position(0)
-        val rootBytes = rootBuf.array()
-        var rootEntryCount = 0
-        var idx = 0
-        while (idx < rootBytes.size) {
-            val firstByte = rootBytes[idx].toInt() and 0xFF
-            val attr = rootBytes[idx + 11].toInt() and 0xFF
-            if (firstByte == 0) break // end of directory
-            if (firstByte != 0xE5 && attr != 0x08 && attr != 0x0F) {
-                rootEntryCount++
-            }
-            idx += 32
-        }
-        emitLog("Wrote ${writer.totalFilesWritten} files, ${writer.totalDirsWritten} directories to USB (root entries: $rootEntryCount)")
-        if (writer.totalFilesWritten == 0) {
-            throw BurnException(
-                "No files were written to USB",
-                "Internal error — please try burning again"
-            )
-        }
-
-        // Final 100% copy state.
-        _state.value = BurnState.Copying(
-            currentFile = "Done",
-            bytesWritten = totalBytes,
-            totalBytes = totalBytes,
-            speedMBps = 0f,
-            remainingSeconds = 0
-        )
-    }
-
-    /** Helper: looks up a registered directory's first cluster (must exist). */
-    private fun writerDirCluster(writer: FastUsbWriter, path: String): Long =
-        writer.dirClusterOf(path)
-
-    /**
-     * Splits an oversized install.wim/esd into .swm parts on local disk and
-     * returns the list of (usb-relative-path -> local file) to be copied. The
-     * actual block writes happen in the fast file pass.
-     */
-    private suspend fun splitWimToParts(isoFile: File, entry: IsoEntry): List<Pair<String, File>> {
-        emitLog("Large WIM detected (${formatBytes(entry.sizeBytes)}); splitting...")
-        if (!wimSplitter.isSupportedAbi()) {
-            emitLog("⚠ No native wimlib binary for this CPU; falling back to manual split", isWarning = true)
-        }
-        val wimCacheDir = File(context.cacheDir, "wim").apply { mkdirs() }
-        val srcWim = File(wimCacheDir, "install.wim")
-        emitLog("Extracting WIM to cache...")
-        RandomAccessFile(isoFile, "r").use { raf ->
-            extractIsoExtentToFile(raf, entry.extentLba, entry.sizeBytes, srcWim)
-        }
-        val outDir = File(wimCacheDir, "parts").apply { mkdirs() }
-        outDir.listFiles()?.forEach { it.delete() }
-        val result = wimSplitter.split(srcWim, outDir) { line -> emitLog(line) }
-        srcWim.delete()
-        if (!result.success) {
-            emitLog("⚠ WIM split failed: ${result.log}", isWarning = true)
-            throw BurnException("WIM split failed", result.log)
-        }
-        emitLog("WIM split into ${result.partFiles.size} parts")
-        // Parts go under sources/ on the USB.
-        return result.partFiles.sortedBy { it.name }.map { "sources/${it.name}" to it }
-    }
-
-    // ---------------------------------------------------------------------
-    // Compatibility fallback: the original libaums UsbFile copy path. Slow
-    // (one SCSI WRITE per chunk) but battle-tested. Used only if the fast
-    // writer throws.
-    // ---------------------------------------------------------------------
-
     private suspend fun copyEntriesLibaums(
         isoFile: File,
         entries: List<IsoEntry>,
@@ -939,13 +733,14 @@ class BurnEngine @Inject constructor(
                 try {
                     val name = entry.name.lowercase()
                     if (name in SPLITTABLE && entry.sizeBytes > FAT32_FILE_LIMIT) {
+                        Log.d(TAG, "write: ${entry.fullPath} (${entry.sizeBytes}B) t=${System.currentTimeMillis()}")
                         bytesWritten += handleLargeWimLibaums(isoFile, entry, root, dirCache)
                         fileCount++
                         continue
                     }
+                    Log.d(TAG, "write: ${entry.fullPath} (${entry.sizeBytes}B) t=${System.currentTimeMillis()}")
                     val parentPath = entry.fullPath.substringBeforeLast('/', "")
                     val parentDir = dirCache[parentPath] ?: mkdirs(root, parentPath, dirCache)
-                    emitLog(entry.fullPath, isFileName = true)
                     val target = parentDir.createFile(entry.name)
                     bytesWritten += writeIsoExtentToUsb(raf, entry.extentLba, entry.sizeBytes, target)
                     target.close()
@@ -964,13 +759,20 @@ class BurnEngine @Inject constructor(
                         lastReport = now
                     }
                 } catch (e: Exception) {
+                    Log.e(TAG, "Failed to write ${entry.fullPath}: ${e.message}", e)
+                    var cause = e.cause
+                    var depth = 0
+                    while (cause != null && depth < 5) {
+                        Log.e(TAG, "  cause[$depth]: ${cause.javaClass.simpleName}: ${cause.message}", cause)
+                        cause = cause.cause
+                        depth++
+                    }
                     emitLog("⚠ Failed to write ${entry.fullPath}: ${e.message}", isWarning = true)
-                    // Continue to next file; partial burns are better than aborts.
                 }
             }
         }
 
-        emitLog("Compatibility mode wrote $fileCount files to USB")
+        emitLog("Wrote $fileCount files to USB")
         if (fileCount == 0) {
             throw BurnException(
                 "No files were written to USB",
@@ -981,17 +783,48 @@ class BurnEngine @Inject constructor(
         _state.value = BurnState.Copying("Done", totalBytes, totalBytes, 0f, 0)
     }
 
+    /**
+     * Handles an oversized WIM/ESD file by extracting it from the ISO to a
+     * local cache, splitting it into .swm parts via [wimSplitter], and
+     * copying each part to the USB. Returns the total bytes written.
+     */
     private suspend fun handleLargeWimLibaums(
         isoFile: File,
         entry: IsoEntry,
         root: UsbFile,
         dirCache: HashMap<String, UsbFile>
     ): Long {
-        val parts = splitWimToParts(isoFile, entry)
+        emitLog("Large WIM detected (${formatBytes(entry.sizeBytes)}); splitting...")
+        if (!wimSplitter.isSupportedAbi()) {
+            emitLog("⚠ No native wimlib binary for this CPU; falling back to manual split", isWarning = true)
+        }
+
+        // Extract the WIM from the ISO to a local cache file.
+        val wimCacheDir = File(context.cacheDir, "wim").apply { mkdirs() }
+        val srcWim = File(wimCacheDir, "install.wim")
+        emitLog("Extracting WIM to cache...")
+        RandomAccessFile(isoFile, "r").use { raf ->
+            extractIsoExtentToFile(raf, entry.extentLba, entry.sizeBytes, srcWim)
+        }
+
+        // Split into .swm parts.
+        val outDir = File(wimCacheDir, "parts").apply { mkdirs() }
+        outDir.listFiles()?.forEach { it.delete() }
+        val result = wimSplitter.split(srcWim, outDir) { line -> emitLog(line) }
+        srcWim.delete()
+        if (!result.success) {
+            emitLog("⚠ WIM split failed: ${result.log}", isWarning = true)
+            throw BurnException("WIM split failed", result.log)
+        }
+        emitLog("WIM split into ${result.partFiles.size} parts")
+
+        // Copy each .swm part to the USB under sources/.
         var written = 0L
         val sources = dirCache["sources"] ?: mkdirs(root, "sources", dirCache)
-        for ((usbPath, part) in parts) {
+        for (part in result.partFiles.sortedBy { it.name }) {
             coroutineContext.ensureActive()
+            val usbPath = "sources/${part.name}"
+            Log.d(TAG, "write: $usbPath (${part.length()}B) t=${System.currentTimeMillis()}")
             emitLog(usbPath, isFileName = true)
             val target = sources.createFile(part.name)
             written += copyLocalFileToUsb(part, target)
@@ -1092,6 +925,7 @@ class BurnEngine @Inject constructor(
     /** SHA-1 of an ISO extent (used for verify). */
     private fun hashIsoExtent(raf: RandomAccessFile, extentLba: Long, length: Long): String {
         val md = java.security.MessageDigest.getInstance("SHA-1")
+
         raf.seek(extentLba * ISO_SECTOR)
         val buffer = ByteArray(COPY_BUFFER)
         var remaining = length

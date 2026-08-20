@@ -3,6 +3,7 @@ package com.burnto.disk.viewmodel
 import android.net.Uri
 import android.content.Context
 import android.hardware.usb.UsbManager
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.burnto.disk.data.BurnSession
@@ -251,6 +252,14 @@ class HomeViewModel @Inject constructor(
                 _formatState.value = FormatUiState.Success
                 refreshUsb()
             } catch (e: Exception) {
+                Log.e("HomeVM", "formatDisk FAILED", e)
+                var cause = e.cause
+                var depth = 0
+                while (cause != null && depth < 5) {
+                    Log.e("HomeVM", "  cause[$depth]: ${cause.javaClass.simpleName}: ${cause.message}", cause)
+                    cause = cause.cause
+                    depth++
+                }
                 _formatState.value = FormatUiState.Error(e.message ?: "Format failed")
             } finally {
                 runCatching { raw?.close() }

@@ -106,32 +106,24 @@ fun BurnProgressScreen(
         it.currentFile == "Parsing ISO..." || it.totalBytes == 0L || it.bytesWritten == 0L
     } ?: false
 
-    val (percent, label, showStats) = when (val s = state) {
-        is BurnState.Idle -> Triple(0, "Preparing...", false)
-        is BurnState.Formatting -> Triple(s.progress, "Formatting FAT32...", false)
+    val (percent, label) = when (val s = state) {
+        is BurnState.Idle -> 0 to "Preparing..."
+        is BurnState.Formatting -> s.progress to "Formatting FAT32..."
         is BurnState.Copying ->
             when {
-                copyDone || finishing -> Triple(100, "Finishing...", false)
-                isParsing -> Triple(0, "Parsing ISO filesystem...", false)
-                else -> Triple(
-                    s.percent,
-                    "Writing files... ${Format.bytes(s.bytesWritten)} of ${Format.bytes(s.totalBytes)}",
-                    true
-                )
+                copyDone || finishing -> 100 to "Finishing..."
+                isParsing -> 0 to "Parsing ISO filesystem..."
+                else -> s.percent to "Writing files... ${Format.bytes(s.bytesWritten)} of ${Format.bytes(s.totalBytes)}"
             }
-        is BurnState.Verifying -> Triple(s.progress, "Verifying...", false)
-        is BurnState.Success -> Triple(100, "Complete", false)
-        is BurnState.Failed -> Triple(0, "Failed", false)
+        is BurnState.Verifying -> s.progress to "Verifying..."
+        is BurnState.Success -> 100 to "Complete"
+        is BurnState.Failed -> 0 to "Failed"
     }
     // Indeterminate only during the very first preparing / parsing moments.
     val isIndeterminate = state is BurnState.Idle || isParsing
     // The ring shows green + checkmark on success, or while finishing (copy is
     // already 100% complete and we are only waiting on the unmount to settle).
     val showSuccessRing = state is BurnState.Success || (finishing && state !is BurnState.Failed)
-
-    // Root-cause-1 visibility: if the engine logged a fallback to the slow path,
-    // surface a persistent warning banner so the slowdown is never silent.
-    val compatibilityMode = logLines.any { it.message.contains("compatibility mode") }
 
     Scaffold(containerColor = NearBlack) { padding ->
         Column(
@@ -142,28 +134,6 @@ fun BurnProgressScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(Modifier.height(24.dp))
-
-            // Compatibility-mode warning banner (visible whenever the fast writer
-            // fell back to the slow libaums path).
-            if (compatibilityMode) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 12.dp)
-                        .background(
-                            com.burnto.disk.ui.theme.WarningYellow.copy(alpha = 0.15f),
-                            RoundedCornerShape(10.dp)
-                        )
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "⚠ Using compatibility mode — burn will be slower",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = com.burnto.disk.ui.theme.WarningYellow
-                    )
-                }
-            }
 
             // ISO -> device header with arrow.
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -203,11 +173,15 @@ fun BurnProgressScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            // Speed / ETA row — only while actively writing files.
-            if (showStats && state is BurnState.Copying) {
-                val s = state as BurnState.Copying
+            // Speed / ETA row — persistent across the whole burn operation.
+            if (state !is BurnState.Idle && state !is BurnState.Success && state !is BurnState.Failed) {
+                val copying = state as? BurnState.Copying
+                val speedText = if (copying != null && copying.speedMBps > 0f)
+                    Format.speedMBps(copying.speedMBps) else "calculating"
+                val etaText = if (copying != null && copying.remainingSeconds > 0)
+                    Format.etaShort(copying.remainingSeconds) else "\u2014"
                 Text(
-                    text = "${Format.speedMBps(s.speedMBps)}  ·  ${Format.etaShort(s.remainingSeconds)}",
+                    text = "$speedText  \u00b7  ETA $etaText",
                     style = MonoText.medium,
                     color = TextSecondary
                 )
