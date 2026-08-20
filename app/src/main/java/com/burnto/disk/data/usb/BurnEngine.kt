@@ -482,27 +482,60 @@ class BurnEngine @Inject constructor(
                 )
             }
 
-            // --- Step 3: format FAT32 ---
-            val formatCapacity = if (rawCapacity > 0L) rawCapacity else capacity
-            val label = isoFile.nameWithoutExtension
-
-            _state.value = BurnState.Formatting(0)
-            emitLog("Formatting FAT32...")
-            val geometry = stage(
-                name = "USB format",
-                suggestion = "USB drive may be write-protected, damaged, or too small. Try a different drive."
-            ) {
-                Fat32Formatter(device.blockDevice).format(formatCapacity, label) { pct ->
-                    _state.value = BurnState.Formatting(pct)
-                }
-            }
-            emitLog("Format complete")
-
             emitLog("Write buffer: ${COPY_BUFFER / 1024}KB")
 
-            // Immediately leave the Formatting state so the UI does not appear
-            // stuck at "Formatting FAT32... 100%". Show a parsing phase while the
-            // ISO is walked (which can take a moment for large images).
+            // --- Step 3: discover existing FAT32 partition ---
+            // The USB must already be formatted (use the Home screen's
+            // "Format Disk" button before burning). We read the BPB to find
+            // the partition start LBA (hidden sectors field) and verify the
+            // 0x55AA boot signature.
+            //
+            // Strategy: scan common partition offsets. The formatter writes a
+            // superfloppy starting at LBA 2048 (1 MB alignment). We also try
+            // LBA 0 for plain/no-offset volumes.
+            val partitionStartLba = stage(
+                name = "Detect USB filesystem",
+                suggestion = "Format the USB drive first using the Home screen, then try burning again."
+            ) {
+                val bs = device.blockSize
+                val candidates = longArrayOf(2048L, 0L) // 1MB-aligned superfloppy, then raw
+                var foundLba = -1L
+                for (lba in candidates) {
+                    val boot = ByteBuffer.allocate(bs)
+                    device.blockDevice.read(lba, boot)
+                    val sig = ((boot.get(510).toInt() and 0xFF) == 0x55) &&
+                        ((boot.get(511).toInt() and 0xFF) == 0xAA)
+                    if (sig) {
+                        // Read hidden sectors (BPB offset 28) as the partition LBA.
+                        // For a superfloppy this is the offset from the start of
+                        // the disk to the first sector of the FAT volume.
+                        val hiddenSectors = ((boot.get(28).toInt() and 0xFF).toLong()) or
+                            ((boot.get(29).toInt() and 0xFF).toLong() shl 8) or
+                            ((boot.get(30).toInt() and 0xFF).toLong() shl 16) or
+                            ((boot.get(31).toInt() and 0xFF).toLong() shl 24)
+                        val oemBytes = ByteArray(8).also { arr ->
+                            boot.position(3)
+                            boot.get(arr)
+                        }
+                        val oem = String(oemBytes, Charsets.US_ASCII).trimEnd()
+                        Log.i(TAG, "[burn] Boot sector at LBA $lba: OEM='$oem' hiddenSectors=$hiddenSectors sig=OK")
+                        emitLog("Found FAT32 at LBA $lba (OEM=$oem)")
+                        foundLba = lba
+                        break
+                    } else {
+                        Log.d(TAG, "[burn] No boot signature at LBA $lba")
+                    }
+                }
+                if (foundLba < 0) {
+                    throw BurnException(
+                        "No FAT32 filesystem found on USB",
+                        "Format the USB drive first using the Home screen, then try burning again."
+                    )
+                }
+                foundLba
+            }
+
+            // Show a parsing state so the UI doesn't appear stuck.
             _state.value = BurnState.Copying(
                 currentFile = "Parsing ISO...",
                 bytesWritten = 0L,
@@ -510,24 +543,6 @@ class BurnEngine @Inject constructor(
                 speedMBps = 0f,
                 remainingSeconds = 0
             )
-
-            // --- Step 3b: format verification (direct boot-sector read) ---
-            // We deliberately do NOT use libaums Fat32FileSystem.read() here: it
-            // can write dirty-mount flags back through the partition reference,
-            // which could disturb reserved sectors. A direct read of the boot
-            // signature is a safe, side-effect-free verification.
-            val partitionStartLba = geometry.partitionStartLba
-            run {
-                val bootBuf = ByteBuffer.allocate(device.blockSize)
-                device.blockDevice.read(partitionStartLba, bootBuf)
-                val sig = ((bootBuf.get(510).toInt() and 0xFF) == 0x55) &&
-                    ((bootBuf.get(511).toInt() and 0xFF) == 0xAA)
-                if (!sig) throw BurnException(
-                    "Format verification failed",
-                    "USB drive may be write-protected or damaged"
-                )
-                emitLog("Format verified OK")
-            }
 
             // --- Step 4: parse ISO ---
             emitLog("Parsing ISO filesystem...")
@@ -580,14 +595,13 @@ class BurnEngine @Inject constructor(
                 )
             }
 
-            // --- Boot-sector verify + rewrite ---
-            // Read back the boot sector after all writes. If its signature was
-            // somehow clobbered, rewrite just the boot sector and its backup
-            // (nothing else) so the volume mounts. This directly targets the
-            // "can't read superblock" failure mode.
+            // --- Post-burn boot-sector verify ---
+            // Verify the boot signature is still intact after all writes.
+            // (No rewrite — we didn't format, so we don't have the geometry to
+            // reconstruct a boot sector.)
             run {
                 val bootVerify = ByteBuffer.allocate(device.blockSize)
-                device.blockDevice.read(geometry.partitionStartLba, bootVerify)
+                device.blockDevice.read(partitionStartLba, bootVerify)
                 val b510 = bootVerify.get(510).toInt() and 0xFF
                 val b511 = bootVerify.get(511).toInt() and 0xFF
                 val oemBytes = ByteArray(8).also { arr ->
@@ -597,11 +611,7 @@ class BurnEngine @Inject constructor(
                 val oem = String(oemBytes, Charsets.US_ASCII)
                 emitLog("Boot sector verify: sig=${b510.toString(16)}${b511.toString(16)} fs='$oem'")
                 if (b510 != 0x55 || b511 != 0xAA) {
-                    emitLog("⚠ Boot sector corrupted! Rewriting...", isWarning = true)
-                    val boot = Fat32Formatter(device.blockDevice).buildPublicBootSector(geometry, label)
-                    device.blockDevice.write(geometry.partitionStartLba, ByteBuffer.wrap(boot))
-                    device.blockDevice.write(geometry.partitionStartLba + 6, ByteBuffer.wrap(boot))
-                    emitLog("Boot sector rewritten.")
+                    emitLog("⚠ Boot sector signature lost after writes!", isWarning = true)
                 }
             }
 
